@@ -24,6 +24,10 @@ from config import (
 from transcriber import TranscriptionResult
 
 
+MAX_WORDS_PER_HOOK_CHUNK = 2500  # keeps us safely under the 8000 TPM limit
+                                 # even with timestamp annotation overhead
+
+
 class HookDetectionError(Exception):
     """Raised when hook detection fails or returns invalid data."""
     pass
@@ -119,7 +123,8 @@ def _call_groq_llm(prompt: str, max_retries: int = 3) -> str:
     """
     Send the prompt to Groq's LLM endpoint and return the raw text response.
     Uses JSON mode to force structurally valid output. Retries on transient
-    server errors.
+    server errors, but fails fast on payload-too-large errors since retrying
+    an oversized request never helps.
     """
     if not GROQ_API_KEY:
         raise HookDetectionError("GROQ_API_KEY is not set. Check your .env file.")
@@ -153,6 +158,14 @@ def _call_groq_llm(prompt: str, max_retries: int = 3) -> str:
             return content
 
         except Exception as e:
+            error_str = str(e)
+            if "413" in error_str or "too large" in error_str.lower():
+                raise HookDetectionError(
+                    f"Request too large for the model's token limit. "
+                    f"This should not happen with chunking enabled — "
+                    f"check MAX_WORDS_PER_HOOK_CHUNK. Error: {e}"
+                ) from e
+
             last_error = e
             wait_time = min(attempt * 3, 15)
             logger.warning(
@@ -164,6 +177,69 @@ def _call_groq_llm(prompt: str, max_retries: int = 3) -> str:
     raise HookDetectionError(
         f"Groq LLM failed after {max_retries} attempts. Last error: {last_error}"
     )
+
+
+def _split_transcript_into_chunks(
+    transcript: TranscriptionResult,
+    max_words: int = MAX_WORDS_PER_HOOK_CHUNK,
+) -> List[TranscriptionResult]:
+    """
+    Split a long transcript into smaller TranscriptionResult chunks by word
+    count, preserving word-level timestamps. Used so hook detection can run
+    on very long videos (podcasts, lectures) without exceeding LLM token
+    limits in a single request.
+    """
+    if len(transcript.words) <= max_words:
+        return [transcript]
+
+    chunks: List[TranscriptionResult] = []
+    words = transcript.words
+
+    for i in range(0, len(words), max_words):
+        chunk_words = words[i : i + max_words]
+        if not chunk_words:
+            continue
+        chunk_text = " ".join(w.word for w in chunk_words)
+        chunk_duration = chunk_words[-1].end - chunk_words[0].start
+        chunks.append(
+            TranscriptionResult(
+                text=chunk_text,
+                words=chunk_words,
+                duration=chunk_duration,
+            )
+        )
+
+    logger.info(
+        f"Transcript has {len(words)} words, split into {len(chunks)} chunks "
+        f"of ~{max_words} words each for hook detection"
+    )
+    return chunks
+
+
+def _detect_hooks_single_chunk(
+    transcript: TranscriptionResult,
+    num_clips: int,
+) -> List[ViralSegment]:
+    """
+    Run hook detection on a single transcript chunk that's guaranteed to fit
+    within token limits. This is the original single-request logic, now
+    used as a building block for the chunked version.
+    """
+    timestamped_text = _build_timestamped_transcript(transcript)
+
+    prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        num_clips=num_clips,
+        min_duration=MIN_CLIP_DURATION_SEC,
+        max_duration=MAX_CLIP_DURATION_SEC,
+        transcript_text=timestamped_text,
+    )
+
+    raw_response = _call_groq_llm(prompt)
+    transcript_end_time = (
+        transcript.words[-1].end if transcript.words else transcript.duration
+    )
+    return _parse_and_validate(raw_response, transcript_end_time)
+
 
 def _parse_and_validate(raw_json: str, transcript_duration: float) -> List[ViralSegment]:
     """
@@ -232,52 +308,66 @@ def detect_hooks(
     num_clips: int = DEFAULT_NUM_CLIPS,
 ) -> List[ViralSegment]:
     """
-    Analyze a transcript and return the top N viral-worthy segments.
+    Analyze a transcript (of any length) and return the top N viral-worthy
+    segments. Automatically chunks very long transcripts across multiple
+    LLM requests to stay within token limits, then merges and ranks results
+    across all chunks.
 
     Args:
         transcript: A TranscriptionResult from transcriber.py.
-        num_clips: How many segments to request.
+        num_clips: How many segments to return overall.
 
     Returns:
         A list of validated ViralSegment objects, sorted by virality_score
         descending, with no overlapping timestamps.
 
     Raises:
-        HookDetectionError: If the API call or JSON parsing fails entirely.
+        HookDetectionError: If every chunk fails (total failure).
     """
-    timestamped_text = _build_timestamped_transcript(transcript)
+    chunks = _split_transcript_into_chunks(transcript)
 
-    prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        num_clips=num_clips,
-        min_duration=MIN_CLIP_DURATION_SEC,
-        max_duration=MAX_CLIP_DURATION_SEC,
-        transcript_text=timestamped_text,
-    )
+    # Ask each chunk for a few candidates — more than num_clips overall,
+    # since we'll filter down to the best across all chunks afterward.
+    candidates_per_chunk = max(2, num_clips)
 
-    logger.info(f"Sending transcript to {GROQ_LLM_MODEL} for hook detection ({num_clips} clips requested)")
+    all_segments: List[ViralSegment] = []
+    failed_chunks = 0
 
-    raw_response = _call_groq_llm(prompt)
-    segments = _parse_and_validate(raw_response, transcript.duration)
+    for i, chunk in enumerate(chunks):
+        logger.info(
+            f"Analyzing chunk {i + 1}/{len(chunks)} "
+            f"({len(chunk.words)} words, ~{chunk.duration / 60:.1f} min)"
+        )
+        try:
+            segments = _detect_hooks_single_chunk(chunk, candidates_per_chunk)
+            all_segments.extend(segments)
+        except HookDetectionError as e:
+            logger.warning(f"Chunk {i + 1}/{len(chunks)} failed, skipping: {e}")
+            failed_chunks += 1
+            continue
 
-    if not segments:
+    if not all_segments:
         raise HookDetectionError(
-            "No valid segments were returned after validation. "
-            "Raw response may have been malformed."
+            f"Hook detection failed on all {len(chunks)} chunks. "
+            "No valid segments could be identified."
         )
 
-    segments = _remove_overlaps(segments)
+    if failed_chunks:
+        logger.warning(f"{failed_chunks}/{len(chunks)} chunks failed but pipeline continued")
 
-    if len(segments) > num_clips:
-        segments = segments[:num_clips]
+    all_segments = _remove_overlaps(all_segments)
 
-    logger.info(f"Hook detection complete: {len(segments)} valid segments identified")
-    for s in segments:
+    if len(all_segments) > num_clips:
+        all_segments = all_segments[:num_clips]
+
+    logger.info(f"Hook detection complete: {len(all_segments)} final segments selected")
+    for s in all_segments:
         logger.info(
             f"  [{s.start_time:.1f}s - {s.end_time:.1f}s] "
             f"({s.duration:.1f}s) score={s.virality_score} — \"{s.headline}\""
         )
 
-    return segments
+    return all_segments
 
 
 if __name__ == "__main__":
