@@ -346,6 +346,11 @@ def detect_hooks(
             failed_chunks += 1
             continue
 
+        # Small pause between chunk requests to stay under Groq's free-tier
+        # requests-per-minute limit, avoiding unnecessary 429 retry delays.
+        if i < len(chunks) - 1:
+            time.sleep(2)
+
     if not all_segments:
         raise HookDetectionError(
             f"Hook detection failed on all {len(chunks)} chunks. "
