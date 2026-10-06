@@ -5,6 +5,8 @@ ffmpeg-python==0.2.0
 pydantic==2.9.2
 yt-dlp==2024.10.22
 pysrt==1.1.2
+opencv-python-headless==4.10.0.84
+numpy>=1.26.0
 # Optional local fallback transcription (CPU-only, no cloud dependency).
 # Uncomment only if you want offline fallback — it's a heavier install (torch).
 # faster-whisper==1.0.3
